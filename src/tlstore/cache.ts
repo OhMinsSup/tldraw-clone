@@ -15,6 +15,6 @@ export class Cache<T extends object, K> {
       this.items.set(item, cb(item));
     }
 
-    return this.items.get(item)!;
+    return this.items.get(item) as K;
   }
 }
