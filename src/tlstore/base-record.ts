@@ -1,5 +1,5 @@
 /** @public */
-export type ID<R extends UnknownRecord> = string & { __type__: R };
+export type RecordId<R extends UnknownRecord> = string & { __type__: R };
 
 /** @public */
 export type IdOf<R extends UnknownRecord> = R["id"];
@@ -11,14 +11,14 @@ export type IdOf<R extends UnknownRecord> = R["id"];
  */
 export interface BaseRecord<
   TypeName extends string,
-  Id extends ID<UnknownRecord>
+  Id extends RecordId<UnknownRecord>
 > {
   readonly id: Id;
   readonly typeName: TypeName;
 }
 
 /** @public */
-export type UnknownRecord = BaseRecord<string, ID<UnknownRecord>>;
+export type UnknownRecord = BaseRecord<string, RecordId<UnknownRecord>>;
 
 export type OmitMeta<R extends UnknownRecord> = R extends R
   ? Omit<R, "id" | "typeName">
