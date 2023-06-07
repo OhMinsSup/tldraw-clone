@@ -8,8 +8,18 @@ import {
   transact,
 } from "signia";
 import { IdOf, RecordId, UnknownRecord } from "./base-record";
-import { objectMapEntries, objectMapFromEntries } from "../tlutils/object";
+import {
+  objectMapEntries,
+  objectMapFromEntries,
+  objectMapKeys,
+  objectMapValues,
+} from "../tlutils/object";
 import { throttledRaf } from "../tlutils/raf";
+import { StoreQueries } from "./store-queries";
+import { SerializedSchema, StoreSchema } from "./store-schema";
+import { Cache } from "./cache";
+import { RecordType } from "./record-type";
+import { devFreeze } from "./dev-freeze";
 
 type RecFromId<K extends RecordId<UnknownRecord>> = K extends RecordId<infer R>
   ? R
@@ -184,6 +194,541 @@ export class Store<R extends UnknownRecord = UnknownRecord, Props = unknown> {
       },
       { scheduleEffect: (cb) => throttledRaf(cb) }
     );
+  }
+
+  public _flushHistory() {
+    // If we have accumulated history, flush it and update listeners
+    if (this.historyAccumulator.hasChanges()) {
+      const entries = this.historyAccumulator.flush();
+      for (const { changes, source } of entries) {
+        this.listeners.forEach((l) => l({ changes, source }));
+      }
+    }
+  }
+
+  /**
+   * Update the history with a diff of changes.
+   *
+   * @param changes - The changes to add to the history.
+   */
+  private updateHistory(changes: RecordsDiff<R>): void {
+    this.historyAccumulator.add({
+      changes,
+      source: this.isMergingRemoteChanges ? "remote" : "user",
+    });
+    if (this.listeners.size === 0) {
+      this.historyAccumulator.clear();
+    }
+    this.history.set(this.history.value + 1, changes);
+  }
+
+  validate(phase: "initialize" | "createRecord" | "updateRecord" | "tests") {
+    this.allRecords().forEach((record) =>
+      this.schema.validateRecord(this, record, phase, null)
+    );
+  }
+
+  /**
+   * A callback fired after a record is created. Use this to perform related updates to other
+   * records in the store.
+   *
+   * @param record - The record to be created
+   */
+  onAfterCreate?: (record: R) => void;
+
+  /**
+   * A callback fired after each record's change.
+   *
+   * @param prev - The previous value, if any.
+   * @param next - The next value.
+   */
+  onAfterChange?: (prev: R, next: R) => void;
+
+  /**
+   * A callback fired before a record is deleted.
+   *
+   * @param prev - The record that will be deleted.
+   */
+  onBeforeDelete?: (prev: R) => void;
+
+  /**
+   * A callback fired after a record is deleted.
+   *
+   * @param prev - The record that will be deleted.
+   */
+  onAfterDelete?: (prev: R) => void;
+
+  // used to avoid running callbacks when rolling back changes in sync client
+  private _runCallbacks = true;
+
+  /**
+   * Add some records to the store. It's an error if they already exist.
+   *
+   * @param records - The records to add.
+   * @public
+   */
+  put = (records: R[], phaseOverride?: "initialize"): void => {
+    transact(() => {
+      const updates: Record<IdOf<UnknownRecord>, [from: R, to: R]> = {};
+      const additions: Record<IdOf<UnknownRecord>, R> = {};
+
+      const currentMap = this.atoms.__unsafe__getWithoutCapture();
+      let map = null as null | Record<IdOf<UnknownRecord>, Atom<R>>;
+
+      // Iterate through all records, creating, updating or removing as needed
+      let record: R;
+
+      // There's a chance that, despite having records, all of the values are
+      // identical to what they were before; and so we'd end up with an "empty"
+      // history entry. Let's keep track of whether we've actually made any
+      // changes (e.g. additions, deletions, or updates that produce a new value).
+      let didChange = false;
+
+      for (let i = 0, n = records.length; i < n; i++) {
+        record = records[i];
+
+        const recordAtom = (map ?? currentMap)[record.id as IdOf<R>];
+
+        if (recordAtom) {
+          // If we already have an atom for this record, update its value.
+
+          const initialValue = recordAtom.__unsafe__getWithoutCapture();
+
+          // Validate the record
+          record = this.schema.validateRecord(
+            this,
+            record,
+            phaseOverride ?? "updateRecord",
+            initialValue
+          );
+
+          recordAtom.set(devFreeze(record));
+
+          // need to deref atom in case nextValue is not identical but is .equals?
+          const finalValue = recordAtom.__unsafe__getWithoutCapture();
+
+          // If the value has changed, assign it to updates.
+          if (initialValue !== finalValue) {
+            didChange = true;
+            updates[record.id] = [initialValue, finalValue];
+          }
+        } else {
+          didChange = true;
+
+          // If we don't have an atom, create one.
+
+          // Validate the record
+          record = this.schema.validateRecord(
+            this,
+            record as R,
+            phaseOverride ?? "createRecord",
+            null
+          );
+
+          // Mark the change as a new addition.
+          additions[record.id] = record;
+
+          // Assign the atom to the map under the record's id.
+          if (!map) {
+            map = { ...currentMap };
+          }
+          map[record.id] = atom("atom:" + record.id, record);
+        }
+      }
+
+      // Set the map of atoms to the store.
+      if (map) {
+        this.atoms.set(map);
+      }
+
+      // If we did change, update the history
+      if (!didChange) return;
+      this.updateHistory({
+        added: additions,
+        updated: updates,
+        removed: {} as Record<IdOf<R>, R>,
+      });
+
+      const { onAfterCreate, onAfterChange } = this;
+
+      if (onAfterCreate && this._runCallbacks) {
+        // Run the onAfterChange callback for addition.
+        Object.values(additions).forEach((record) => {
+          onAfterCreate(record);
+        });
+      }
+
+      if (onAfterChange && this._runCallbacks) {
+        // Run the onAfterChange callback for update.
+        Object.values(updates).forEach(([from, to]) => {
+          onAfterChange(from, to);
+        });
+      }
+    });
+  };
+
+  /**
+   * Remove some records from the store via their ids.
+   *
+   * @param ids - The ids of the records to remove.
+   * @public
+   */
+  remove = (ids: IdOf<R>[]): void => {
+    transact(() => {
+      if (this.onBeforeDelete && this._runCallbacks) {
+        for (const id of ids) {
+          const atom = this.atoms.__unsafe__getWithoutCapture()[id];
+          if (!atom) continue;
+
+          this.onBeforeDelete(atom.value);
+        }
+      }
+
+      let removed = undefined as undefined | RecordsDiff<R>["removed"];
+
+      // For each map in our atoms, remove the ids that we are removing.
+      this.atoms.update((atoms) => {
+        let result: typeof atoms | undefined = undefined;
+
+        for (const id of ids) {
+          if (!(id in atoms)) continue;
+          if (!result) result = { ...atoms };
+          if (!removed) removed = {} as Record<IdOf<R>, R>;
+          delete result[id];
+          removed[id] = atoms[id].value;
+        }
+
+        return result ?? atoms;
+      });
+
+      if (!removed) return;
+      // Update the history with the removed records.
+      this.updateHistory({ added: {}, updated: {}, removed } as RecordsDiff<R>);
+
+      // If we have an onAfterChange, run it for each removed record.
+      if (this.onAfterDelete && this._runCallbacks) {
+        for (let i = 0, n = ids.length; i < n; i++) {
+          this.onAfterDelete(removed[ids[i]]);
+        }
+      }
+    });
+  };
+
+  /**
+   * Get the value of a store record by its id.
+   *
+   * @param id - The id of the record to get.
+   * @public
+   */
+  get = <K extends IdOf<R>>(id: K): RecFromId<K> | undefined => {
+    return this.atoms.value[id]?.value as any;
+  };
+
+  /**
+   * Get the value of a store record by its id without updating its epoch.
+   *
+   * @param id - The id of the record to get.
+   * @public
+   */
+  unsafeGetWithoutCapture = <K extends IdOf<R>>(
+    id: K
+  ): RecFromId<K> | undefined => {
+    return this.atoms.value[id]?.__unsafe__getWithoutCapture() as any;
+  };
+
+  /**
+   * Opposite of `deserialize`. Creates a JSON payload from the record store.
+   *
+   * @param filter - A function to filter structs that do not satisfy the predicate.
+   * @returns The record store snapshot as a JSON payload.
+   */
+  serialize = (filter?: (record: R) => boolean): StoreSnapshot<R> => {
+    const result = {} as StoreSnapshot<R>;
+    for (const [id, atom] of objectMapEntries(this.atoms.value)) {
+      const record = atom.value;
+      if (typeof filter === "function" && !filter(record)) continue;
+      result[id as IdOf<R>] = record;
+    }
+    return result;
+  };
+
+  /**
+   * The same as `serialize`, but only serializes records with a scope of `document`.
+   * @returns The record store snapshot as a JSON payload.
+   */
+  serializeDocumentState = (): StoreSnapshot<R> => {
+    return this.serialize((r) => {
+      const type = this.schema.types[r.typeName as R["typeName"]] as RecordType<
+        any,
+        any
+      >;
+      return type.scope === "document";
+    });
+  };
+
+  /**
+   * Opposite of `serialize`. Replace the store's current records with records as defined by a
+   * simple JSON structure into the stores.
+   *
+   * @param snapshot - The JSON snapshot to deserialize.
+   * @public
+   */
+  deserialize = (snapshot: StoreSnapshot<R>): void => {
+    transact(() => {
+      this.clear();
+      this.put(Object.values(snapshot));
+    });
+  };
+
+  /**
+   * Get a serialized snapshot of the store and its schema.
+   *
+   * ```ts
+   * const snapshot = store.getSnapshot()
+   * store.loadSnapshot(snapshot)
+   * ```
+   *
+   * @public
+   */
+  getSnapshot() {
+    return {
+      store: this.serializeDocumentState(),
+      schema: this.schema.serialize(),
+    };
+  }
+
+  /**
+   * Load a serialized snapshot.
+   *
+   * ```ts
+   * const snapshot = store.getSnapshot()
+   * store.loadSnapshot(snapshot)
+   * ```
+   *
+   * @param snapshot - The snapshot to load.
+   *
+   * @public
+   */
+  loadSnapshot(snapshot: {
+    store: StoreSnapshot<R>;
+    schema: SerializedSchema;
+  }): void {
+    const migrationResult = this.schema.migrateStoreSnapshot(
+      snapshot.store,
+      snapshot.schema
+    );
+
+    if (migrationResult.type === "error") {
+      throw new Error(`Failed to migrate snapshot: ${migrationResult.reason}`);
+    }
+
+    this.deserialize(migrationResult.value);
+  }
+
+  /**
+   * Get an array of all values in the store.
+   *
+   * @returns An array of all values in the store.
+   * @public
+   */
+  allRecords = (): R[] => {
+    return objectMapValues(this.atoms.value).map((atom) => atom.value);
+  };
+
+  /**
+   * Removes all records from the store.
+   *
+   * @public
+   */
+  clear = (): void => {
+    this.remove(objectMapKeys(this.atoms.value));
+  };
+
+  /**
+   * Update a record. To update multiple records at once, use the `update` method of the
+   * `TypedStore` class.
+   *
+   * @param id - The id of the record to update.
+   * @param updater - A function that updates the record.
+   */
+  update = <K extends IdOf<R>>(
+    id: K,
+    updater: (record: RecFromId<K>) => RecFromId<K>
+  ) => {
+    const atom = this.atoms.value[id];
+    if (!atom) {
+      console.error(`Record ${id} not found. This is probably an error`);
+      return;
+    }
+    this.put([
+      updater(atom.__unsafe__getWithoutCapture() as any as RecFromId<K>) as any,
+    ]);
+  };
+
+  /**
+   * Get whether the record store has a id.
+   *
+   * @param id - The id of the record to check.
+   * @public
+   */
+  has = <K extends IdOf<R>>(id: K): boolean => {
+    return !!this.atoms.value[id];
+  };
+
+  /**
+   * Add a new listener to the store.
+   *
+   * @param listener - The listener to call when the store updates.
+   * @returns A function to remove the listener.
+   */
+  listen = (listener: StoreListener<R>) => {
+    // flush history so that this listener's history starts from exactly now
+    this._flushHistory();
+
+    this.listeners.add(listener);
+
+    if (!this.historyReactor.scheduler.isActivelyListening) {
+      this.historyReactor.start();
+    }
+
+    return () => {
+      this.listeners.delete(listener);
+
+      if (this.listeners.size === 0) {
+        this.historyReactor.stop();
+      }
+    };
+  };
+
+  private isMergingRemoteChanges = false;
+
+  /**
+   * Merge changes from a remote source without triggering listeners.
+   *
+   * @param fn - A function that merges the external changes.
+   * @public
+   */
+  mergeRemoteChanges = (fn: () => void) => {
+    if (this.isMergingRemoteChanges) {
+      return fn();
+    }
+
+    try {
+      this.isMergingRemoteChanges = true;
+      transact(fn);
+    } finally {
+      this.isMergingRemoteChanges = false;
+    }
+  };
+
+  extractingChanges(fn: () => void): RecordsDiff<R> {
+    const changes: Array<RecordsDiff<R>> = [];
+    const dispose = this.historyAccumulator.intercepting((entry) =>
+      changes.push(entry.changes)
+    );
+    try {
+      transact(fn);
+      return squashRecordDiffs(changes);
+    } finally {
+      dispose();
+    }
+  }
+
+  applyDiff(diff: RecordsDiff<R>, runCallbacks = true) {
+    const prevRunCallbacks = this._runCallbacks;
+    try {
+      this._runCallbacks = runCallbacks;
+      transact(() => {
+        const toPut = objectMapValues(diff.added).concat(
+          objectMapValues(diff.updated).map(([_from, to]) => to)
+        );
+        const toRemove = objectMapKeys(diff.removed);
+        if (toPut.length) {
+          this.put(toPut);
+        }
+        if (toRemove.length) {
+          this.remove(toRemove);
+        }
+      });
+    } finally {
+      this._runCallbacks = prevRunCallbacks;
+    }
+  }
+
+  /**
+   * Create a computed cache.
+   *
+   * @param name - The name of the derivation cache.
+   * @param derive - A function used to derive the value of the cache.
+   * @public
+   */
+  createComputedCache = <T, V extends R = R>(
+    name: string,
+    derive: (record: V) => T | undefined
+  ): ComputedCache<T, V> => {
+    const cache = new Cache<Atom<any>, Computed<T | undefined>>();
+    return {
+      get: (id: IdOf<V>) => {
+        const atom = this.atoms.value[id];
+        if (!atom) {
+          return undefined;
+        }
+        return cache.get(atom, () =>
+          computed<T | undefined>(name + ":" + id, () =>
+            derive(atom.value as V)
+          )
+        ).value;
+      },
+    };
+  };
+
+  /**
+   * Create a computed cache from a selector
+   *
+   * @param name - The name of the derivation cache.
+   * @param selector - A function that returns a subset of the original shape
+   * @param derive - A function used to derive the value of the cache.
+   * @public
+   */
+  createSelectedComputedCache = <T, J, V extends R = R>(
+    name: string,
+    selector: (record: V) => T | undefined,
+    derive: (input: T) => J | undefined
+  ): ComputedCache<J, V> => {
+    const cache = new Cache<Atom<any>, Computed<J | undefined>>();
+    return {
+      get: (id: IdOf<V>) => {
+        const atom = this.atoms.value[id];
+        if (!atom) {
+          return undefined;
+        }
+
+        const d = computed<T | undefined>(name + ":" + id + ":selector", () =>
+          selector(atom.value as V)
+        );
+        return cache.get(atom, () =>
+          computed<J | undefined>(name + ":" + id, () => derive(d.value as T))
+        ).value;
+      },
+    };
+  };
+
+  private _integrityChecker?: () => void | undefined;
+
+  /** @internal */
+  ensureStoreIsUsable() {
+    this._integrityChecker ??= this.schema.createIntegrityChecker(this);
+    this._integrityChecker?.();
+  }
+
+  private _isPossiblyCorrupted = false;
+  /** @internal */
+  markAsPossiblyCorrupted() {
+    this._isPossiblyCorrupted = true;
+  }
+  /** @internal */
+  isPossiblyCorrupted() {
+    return this._isPossiblyCorrupted;
   }
 }
 

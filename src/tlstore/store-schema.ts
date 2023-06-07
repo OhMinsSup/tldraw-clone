@@ -1,6 +1,13 @@
 import { objectMapValues } from "../tlutils/object";
 import { getOwnProperty } from "../tlutils/object";
 import { IdOf, UnknownRecord } from "./base-record";
+import {
+  MigrationFailureReason,
+  MigrationResult,
+  Migrations,
+  migrate,
+  migrateRecord,
+} from "./migrate";
 import { RecordType } from "./record-type";
 import { Store, StoreSnapshot } from "./store";
 

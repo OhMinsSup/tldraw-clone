@@ -1,6 +1,8 @@
 import { nanoid } from "../tlutils/id";
 import { structuredClone } from "../tlutils/value";
 import type { IdOf, OmitMeta, UnknownRecord } from "./base-record";
+import { Migrations } from "./migrate";
+import { StoreValidator } from "./store";
 
 export type RecordTypeRecord<R extends RecordType<any, any>> = ReturnType<
   R["create"]

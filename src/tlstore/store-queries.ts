@@ -1,6 +1,7 @@
 import {
   Atom,
   Computed,
+  EMPTY_ARRAY,
   RESET_VALUE,
   computed,
   isUninitialized,
@@ -12,6 +13,11 @@ import { CollectionDiff, RecordsDiff } from "./store";
 import { objectMapValues } from "../tlutils/object";
 import { IncrementalSetConstructor } from "./incremental-set-constructor";
 import { diffSets } from "./set-utils";
+import {
+  QueryExpression,
+  executeQuery,
+  objectMatchesQuery,
+} from "./execute-query";
 
 export type RSIndexDiff<
   R extends UnknownRecord,
