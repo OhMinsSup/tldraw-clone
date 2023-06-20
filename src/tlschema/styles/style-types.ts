@@ -1,3 +1,4 @@
+import { TLShapeProps } from "../records/TLShape";
 import { TLAlignStyle } from "./TLAlignStyle";
 import { TLArrowheadEndStyle, TLArrowheadStartStyle } from "./TLArrowheadStyle";
 import { TLStyleType } from "./TLBaseStyle";
